@@ -29,11 +29,7 @@ impl Clock {
     }
 
     pub fn expire_ns(&self, ttl: u64) -> u64 {
-        if ttl > 0 {
-            self.now_ns() + ttl
-        } else {
-            0
-        }
+        if ttl > 0 { self.now_ns() + ttl } else { 0 }
     }
 }
 
@@ -368,10 +364,10 @@ mod tests {
     fn test_advance_large() {
         let mut core = TlfuCore::new(1000);
         let now = core.wheel.clock.now_ns();
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         for _ in 0..50000 {
-            let expire = now + Duration::from_secs(rng.gen_range(5..250)).as_nanos() as u64;
-            core.set(vec![(rng.gen_range(0..10000), expire as i64)]);
+            let expire = now + Duration::from_secs(rng.random_range(5..250)).as_nanos() as u64;
+            core.set(vec![(rng.random_range(0..10000), expire as i64)]);
         }
 
         for dt in [5, 6, 7, 10, 15, 20, 25, 50, 51, 52, 53, 70, 75, 85, 100] {
@@ -383,8 +379,8 @@ mod tests {
 
         let now = core.wheel.clock.now_ns();
         for _ in 0..10000 {
-            let expire = now + Duration::from_secs(rng.gen_range(110..250)).as_nanos() as u64;
-            core.set(vec![(rng.gen_range(0..1000), expire as i64)]);
+            let expire = now + Duration::from_secs(rng.random_range(110..250)).as_nanos() as u64;
+            core.set(vec![(rng.random_range(0..1000), expire as i64)]);
         }
         for dt in [5, 6, 7, 10, 15, 20, 25, 50, 51, 52, 53, 70, 75, 85, 100] {
             core.wheel.advance(

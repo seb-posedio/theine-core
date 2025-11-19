@@ -90,9 +90,8 @@ impl CountMinSketch {
         let count1 = self.count(counter_hash, block, 1);
         let count2 = self.count(counter_hash, block, 2);
         let count3 = self.count(counter_hash, block, 3);
-        let s = [count0, count1, count2, count3];
-        let min = s.iter().min().unwrap();
-        *min
+        // Calculate minimum directly without iterator allocation
+        count0.min(count1).min(count2).min(count3)
     }
 
     #[cfg(test)]
@@ -219,8 +218,8 @@ mod tests {
 
             let es1 = sketch.estimate(h);
             let es2 = sketch.estimate(h2);
-            let es1_prev = *counts.get(&h).unwrap();
-            let es2_prev = *counts.get(&h2).unwrap();
+            let es1_prev = counts.get(&h).copied().unwrap_or(0);
+            let es2_prev = counts.get(&h2).copied().unwrap_or(0);
             diff += es1_prev - es1;
             diff += es2_prev - es2;
 

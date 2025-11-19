@@ -8,6 +8,7 @@ name = "theine_core"
 crate-type = ["cdylib"]
 
 [dependencies]
+anyhow = "1.0"
 dlv-list = "0.6"
 pyo3 = { version = "0.27.1", features = ["extension-module"] }
 rand = "0.9"

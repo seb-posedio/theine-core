@@ -77,10 +77,10 @@ impl<T> List<T> {
 
     /// Move entry to front of link
     pub fn touch(&mut self, index: Index<T>) {
-        if let Some(front) = self.list.front_index() {
-            if front != index {
-                self.list.move_before(index, front);
-            }
+        if let Some(front) = self.list.front_index()
+            && front != index
+        {
+            self.list.move_before(index, front);
         }
     }
 

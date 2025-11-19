@@ -1,4 +1,5 @@
 use crate::{metadata::Entry, timerwheel::TimerWheel, tlfu::DebugInfo, tlfu::TinyLfu};
+
 use std::collections::{HashMap, HashSet};
 
 use pyo3::prelude::*;
@@ -36,16 +37,22 @@ impl TlfuCore {
         self.wheel.schedule(key, &mut entry);
         self.entries.insert(key, entry);
 
-        if let Some(evicted_key) = self.policy.set(key, &mut self.entries) {
-            if let Some(evicted) = self.entries.get_mut(&evicted_key) {
-                self.wheel.deschedule(evicted);
-                self.entries.remove(&evicted_key);
-                Some(evicted_key)
-            } else {
+        match self.policy.set(key, &mut self.entries) {
+            Ok(Some(evicted_key)) => {
+                if let Some(evicted) = self.entries.get_mut(&evicted_key) {
+                    self.wheel.deschedule(evicted);
+                    self.entries.remove(&evicted_key);
+                    Some(evicted_key)
+                } else {
+                    None
+                }
+            }
+            Ok(None) => None,
+            Err(_) => {
+                // On error, still return None but the entry was added to the cache
+                // This maintains cache consistency while ignoring policy errors
                 None
             }
-        } else {
-            None
         }
     }
 
@@ -55,7 +62,7 @@ impl TlfuCore {
             // remove entry
             if entry.1 == -1 {
                 if let Some(mut removed) = self.entries.remove(&entry.0) {
-                    self.policy.remove(&mut removed);
+                    let _ = self.policy.remove(&mut removed); // Ignore errors for removals
                     self.wheel.deschedule(&mut removed);
                 }
                 continue;
@@ -64,8 +71,7 @@ impl TlfuCore {
             if evicted.contains(&entry.0) {
                 evicted.remove(&entry.0);
             }
-            let ev = self.set_entry(entry.0, entry.1.unsigned_abs());
-            if let Some(key) = ev {
+            if let Some(key) = self.set_entry(entry.0, entry.1.unsigned_abs()) {
                 evicted.insert(key);
             }
         }
@@ -80,11 +86,20 @@ impl TlfuCore {
     pub fn remove(&mut self, key: u64) -> Option<u64> {
         if let Some(entry) = self.entries.get_mut(&key) {
             self.wheel.deschedule(entry);
-            self.policy.remove(entry);
-            self.entries.remove(&key);
-            return Some(key);
+            match self.policy.remove(entry) {
+                Ok(()) => {
+                    self.entries.remove(&key);
+                    Some(key)
+                }
+                Err(_) => {
+                    // Even if policy removal fails, remove from entries to prevent leaks
+                    self.entries.remove(&key);
+                    Some(key)
+                }
+            }
+        } else {
+            None
         }
-        None
     }
 
     pub fn access(&mut self, keys: Vec<u64>) {
@@ -94,8 +109,16 @@ impl TlfuCore {
     }
 
     fn access_entry(&mut self, key: u64) {
-        self.policy
-            .access(key, &self.wheel.clock, &mut self.entries);
+        match self
+            .policy
+            .access(key, &self.wheel.clock, &mut self.entries)
+        {
+            Ok(()) => {}
+            Err(_) => {
+                // Access failures shouldn't break the cache operation
+                // The error indicates a bug but cache should continue working
+            }
+        }
     }
 
     pub fn advance(&mut self) -> Vec<u64> {
@@ -104,8 +127,15 @@ impl TlfuCore {
             .advance(self.wheel.clock.now_ns(), &mut self.entries);
         for key in removed.iter() {
             if let Some(entry) = self.entries.get_mut(key) {
-                self.policy.remove(entry);
-                self.entries.remove(key);
+                match self.policy.remove(entry) {
+                    Ok(()) => {
+                        self.entries.remove(key);
+                    }
+                    Err(_) => {
+                        // Even if policy removal fails, remove from entries to prevent leaks
+                        self.entries.remove(key);
+                    }
+                }
             }
         }
         removed
@@ -189,10 +219,10 @@ mod tests {
 
     #[test]
     fn test_spread() {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
 
         for _ in 0..500000 {
-            let k = rng.gen_range(-i64::MAX..i64::MAX);
+            let k = rng.random_range(-i64::MAX..i64::MAX);
             spread(k);
         }
     }

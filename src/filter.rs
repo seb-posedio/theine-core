@@ -23,7 +23,7 @@ impl BloomFilter {
             insertions,
             bits_mask: bits - 1,
             slice_count: (ln2 * bits as f64 / insertions as f64) as usize,
-            bits: vec![0; (bits + 63) / 64],
+            bits: vec![0; bits.div_ceil(64)],
             additions: 0,
         }
     }
