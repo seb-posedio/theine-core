@@ -4,8 +4,8 @@ use crate::metadata::Entry;
 use crate::sketch::CountMinSketch;
 use crate::timerwheel::Clock;
 use anyhow::Result;
+use log;
 use pyo3::prelude::pyclass;
-use rand::Rng;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 
@@ -35,27 +35,58 @@ pub struct TinyLfu {
 
 impl TinyLfu {
     pub fn new(size: usize) -> TinyLfu {
-        let mut lru_size = (size as f64 * 0.01) as usize;
+        // Input validation: ensure minimum cache size
+        let capacity = if size == 0 {
+            log::warn!("TinyLFU: size is 0, using minimum size of 1");
+            1
+        } else {
+            size
+        };
+
+        let mut lru_size = (capacity as f64 * 0.01) as usize;
         if lru_size == 0 {
             lru_size = 1;
         }
-        let slru_size = size - lru_size;
+        let slru_size = capacity - lru_size;
+
+        log::debug!(
+            "TinyLFU created: capacity={}, window_size={}, slru_size={}",
+            capacity,
+            lru_size,
+            slru_size
+        );
+
         TinyLfu {
             size: 0,
-            capacity: size,
+            capacity,
             window: Lru::new(lru_size),
             main: Slru::new(slru_size),
-            sketch: CountMinSketch::new(size),
+            sketch: CountMinSketch::new(capacity),
             hit_in_sample: 0,
             misses_in_sample: 0,
             hr: 0.0,
-            step: -(size as f32) * 0.0625,
+            step: -(capacity as f32) * 0.0625,
             amount: 0,
         }
     }
 
     #[cfg(test)]
     pub fn new_sized(wsize: usize, msize: usize, psize: usize) -> TinyLfu {
+        // Input validation
+        let wsize = if wsize == 0 { 1 } else { wsize };
+        let msize = if msize == 0 { 1 } else { msize };
+        let psize = if psize == 0 { 1 } else { psize };
+
+        // Validate psize doesn't exceed msize
+        let psize = psize.min(msize);
+
+        log::debug!(
+            "TinyLFU new_sized: wsize={}, msize={}, psize={}",
+            wsize,
+            msize,
+            psize
+        );
+
         let mut t = TinyLfu {
             size: 0,
             capacity: wsize + msize,
@@ -95,7 +126,15 @@ impl TinyLfu {
             if let Some(&k) = key
                 && let Some(entry) = entries.get_mut(&k)
             {
-                self.main.remove(entry)?;
+                if let Err(e) = self.main.remove(entry) {
+                    log::warn!(
+                        "TinyLFU increase_window: error removing entry {} from main: {}",
+                        k,
+                        e
+                    );
+                    // Continue despite error to avoid deadlock
+                    continue;
+                }
                 self.window.insert(k, entry);
             }
         }
@@ -122,7 +161,15 @@ impl TinyLfu {
             if let Some(&k) = key
                 && let Some(entry) = entries.get_mut(&k)
             {
-                self.window.remove(entry)?;
+                if let Err(e) = self.window.remove(entry) {
+                    log::warn!(
+                        "TinyLFU decrease_window: error removing entry {} from window: {}",
+                        k,
+                        e
+                    );
+                    // Continue despite error to avoid deadlock
+                    continue;
+                }
                 self.main.insert(k, entry);
             }
         }
@@ -131,22 +178,51 @@ impl TinyLfu {
 
     // move entry from protected to probation
     fn demote_from_protected(&mut self, entries: &mut HashMap<u64, Entry>) {
+        let mut demoted_count = 0;
         while self.main.protected.len() > self.main.protected.capacity {
             if let Some(key) = self.main.protected.pop_tail()
                 && let Some(entry) = entries.get_mut(&key)
             {
                 self.main.insert(key, entry);
+                demoted_count += 1;
+            } else {
+                // Avoid infinite loop if pop_tail fails
+                log::warn!("TinyLFU demote_from_protected: failed to pop or get entry, breaking");
+                break;
             }
+        }
+        if demoted_count > 0 {
+            log::debug!(
+                "TinyLFU demote_from_protected: demoted {} entries",
+                demoted_count
+            );
         }
     }
 
     fn resize_window(&mut self, entries: &mut HashMap<u64, Entry>) -> Result<()> {
-        self.window.list.capacity = self.window.list.capacity.saturating_add_signed(self.amount);
-        self.main.protected.capacity = self
+        // Validate capacity adjustments won't go negative or zero
+        let new_window_cap = self
+            .window
+            .list
+            .capacity
+            .saturating_add_signed(self.amount)
+            .max(1);
+        let new_protected_cap = self
             .main
             .protected
             .capacity
-            .saturating_add_signed(-self.amount);
+            .saturating_add_signed(-self.amount)
+            .max(1);
+
+        log::debug!(
+            "TinyLFU resize_window: amount={}, new_window_cap={}, new_protected_cap={}",
+            self.amount,
+            new_window_cap,
+            new_protected_cap
+        );
+
+        self.window.list.capacity = new_window_cap;
+        self.main.protected.capacity = new_protected_cap;
         // demote first to make sure policy size is right
         self.demote_from_protected(entries);
 
@@ -216,6 +292,11 @@ impl TinyLfu {
 
     // add/update key
     pub fn set(&mut self, key: u64, entries: &mut HashMap<u64, Entry>) -> Result<Option<u64>> {
+        // Validate key is not zero (reserved value)
+        if key == 0 {
+            log::warn!("TinyLFU set: key is 0, which is reserved");
+        }
+
         if self.hit_in_sample + self.misses_in_sample > self.sketch.sample_size {
             self.climb();
             self.resize_window(entries)?;
@@ -224,9 +305,9 @@ impl TinyLfu {
         if let Some(entry) = entries.get_mut(&key) {
             // new entry
             if entry.policy_list_id == 0 {
-                self.misses_in_sample += 1;
+                self.misses_in_sample = self.misses_in_sample.saturating_add(1);
                 self.window.insert(key, entry);
-                self.size += 1;
+                self.size = self.size.saturating_add(1);
                 self.sketch.add(key);
             }
         }
@@ -249,7 +330,7 @@ impl TinyLfu {
         self.sketch.add(key);
 
         if let Some(entry) = entries.get_mut(&key) {
-            self.hit_in_sample += 1;
+            self.hit_in_sample = self.hit_in_sample.saturating_add(1);
             if entry.expire != 0 && entry.expire <= clock.now_ns() {
                 return Ok(());
             }
@@ -261,15 +342,24 @@ impl TinyLfu {
                         Ok(())
                     }
                     2 | 3 => self.main.access(key, entries),
-                    _ => unreachable!(),
+                    id => {
+                        let err = anyhow::anyhow!(
+                            "TinyLFU access: unexpected policy_list_id {}, this indicates a bug",
+                            id
+                        );
+                        log::error!("{}", err);
+                        Err(err)
+                    }
                 }?;
                 Ok(())
             } else {
-                Err(anyhow::anyhow!(
+                let err = anyhow::anyhow!(
                     "TinyLFU access: missing policy_list_index for entry {} with policy_list_id {}, this indicates a bug",
                     key,
                     entry.policy_list_id
-                ))
+                );
+                log::error!("{}", err);
+                Err(err)
             }
         } else {
             Ok(())
@@ -286,15 +376,22 @@ impl TinyLfu {
             0 => Ok(()),
             1 => {
                 self.window.remove(entry)?;
-                self.size -= 1;
+                self.size = self.size.saturating_sub(1);
                 Ok(())
             }
             2 | 3 => {
                 self.main.remove(entry)?;
-                self.size -= 1;
+                self.size = self.size.saturating_sub(1);
                 Ok(())
             }
-            _ => unreachable!(),
+            id => {
+                let err = anyhow::anyhow!(
+                    "TinyLFU remove: unexpected policy_list_id {}, this indicates a bug",
+                    id
+                );
+                log::error!("{}", err);
+                Err(err)
+            }
         }
     }
 
@@ -434,10 +531,14 @@ impl TinyLfu {
     fn admit(&self, candidate: u64, victim: u64) -> bool {
         let victim_freq = self.sketch.estimate(victim);
         let candidate_freq = self.sketch.estimate(candidate);
+
         if candidate_freq > victim_freq {
             true
         } else if candidate_freq > ADMIT_HASHDOS_THRESHOLD {
-            rand::rng().random::<i32>() & 127 == 0
+            // Use deterministic comparison based on hash values for robustness
+            // This avoids relying on RNG state and provides consistent behavior
+            let combined = candidate.wrapping_add(victim);
+            (combined & 127) == 0
         } else {
             false
         }

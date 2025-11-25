@@ -48,9 +48,10 @@ impl TlfuCore {
                 }
             }
             Ok(None) => None,
-            Err(_) => {
-                // On error, still return None but the entry was added to the cache
-                // This maintains cache consistency while ignoring policy errors
+            Err(e) => {
+                // Log the error but continue - entry was already added to cache
+                // This maintains cache consistency while making the error visible
+                log::error!("Policy error during set_entry for key {}: {}", key, e);
                 None
             }
         }
@@ -62,7 +63,9 @@ impl TlfuCore {
             // remove entry
             if entry.1 == -1 {
                 if let Some(mut removed) = self.entries.remove(&entry.0) {
-                    let _ = self.policy.remove(&mut removed); // Ignore errors for removals
+                    if let Err(e) = self.policy.remove(&mut removed) {
+                        log::warn!("Policy error during removal of key {}: {}", entry.0, e);
+                    }
                     self.wheel.deschedule(&mut removed);
                 }
                 continue;
@@ -91,8 +94,9 @@ impl TlfuCore {
                     self.entries.remove(&key);
                     Some(key)
                 }
-                Err(_) => {
-                    // Even if policy removal fails, remove from entries to prevent leaks
+                Err(e) => {
+                    // Log the error but still remove from entries to prevent leaks
+                    log::error!("Policy error during remove for key {}: {}", key, e);
                     self.entries.remove(&key);
                     Some(key)
                 }
@@ -114,9 +118,9 @@ impl TlfuCore {
             .access(key, &self.wheel.clock, &mut self.entries)
         {
             Ok(()) => {}
-            Err(_) => {
-                // Access failures shouldn't break the cache operation
-                // The error indicates a bug but cache should continue working
+            Err(e) => {
+                // Log access failures - they indicate bugs in the policy implementation
+                log::error!("Policy error during access for key {}: {}", key, e);
             }
         }
     }
@@ -131,8 +135,9 @@ impl TlfuCore {
                     Ok(()) => {
                         self.entries.remove(key);
                     }
-                    Err(_) => {
-                        // Even if policy removal fails, remove from entries to prevent leaks
+                    Err(e) => {
+                        // Log the error but still remove from entries to prevent leaks
+                        log::error!("Policy error during advance removal for key {}: {}", key, e);
                         self.entries.remove(key);
                     }
                 }

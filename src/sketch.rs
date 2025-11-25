@@ -1,3 +1,5 @@
+use log;
+
 const RESET_MASK: u64 = 0x7777777777777777;
 const ONE_MASK: u64 = 0x1111111111111111;
 
@@ -10,32 +12,95 @@ pub struct CountMinSketch {
 
 impl CountMinSketch {
     pub fn new(size: usize) -> CountMinSketch {
+        // Input validation and safety checks
         let mut sketch_size = size;
         if sketch_size < 64 {
             sketch_size = 64;
+            log::debug!(
+                "CountMinSketch: size too small, adjusted to {}",
+                sketch_size
+            );
         }
+
         let counter_size = sketch_size.next_power_of_two();
-        let block_mask = (counter_size >> 3) - 1;
+
+        // Prevent excessive memory allocation
+        if counter_size > 1 << 20 {
+            log::warn!(
+                "CountMinSketch: counter_size {} is very large, may cause memory issues",
+                counter_size
+            );
+        }
+
+        let block_mask = (counter_size >> 3).saturating_sub(1);
         let table = vec![0; counter_size];
+
+        let sample_size = counter_size.saturating_mul(10);
+
+        log::debug!(
+            "CountMinSketch created: size={}, counter_size={}, block_mask={}, sample_size={}",
+            size,
+            counter_size,
+            block_mask,
+            sample_size
+        );
+
         CountMinSketch {
             additions: 0,
-            sample_size: 10 * counter_size,
+            sample_size,
             table,
             block_mask,
         }
     }
 
     fn index_of(&self, counter_hash: u64, block: u64, offset: u8) -> (usize, usize) {
+        if offset > 3 {
+            log::warn!("CountMinSketch: offset {} out of range [0-3]", offset);
+            return (0, 0);
+        }
+
         let h = counter_hash >> (offset << 3);
-        let index = block + (h & 1) + (offset << 1) as u64;
-        (index as usize, (h >> 1 & 0xf) as usize)
+        let index = block
+            .saturating_add(h & 1)
+            .saturating_add((offset as u64) << 1);
+
+        let table_len = self.table.len();
+        let index_safe = if index as usize >= table_len {
+            log::warn!(
+                "CountMinSketch: computed index {} exceeds table length {}",
+                index,
+                table_len
+            );
+            0
+        } else {
+            index as usize
+        };
+
+        let offset_val = (h >> 1 & 0xf) as usize;
+        (index_safe, offset_val)
     }
 
     fn inc(&mut self, index: usize, offset: usize) -> bool {
+        // Bounds check
+        if index >= self.table.len() {
+            log::error!(
+                "CountMinSketch: index {} out of bounds [0-{})",
+                index,
+                self.table.len()
+            );
+            return false;
+        }
+
+        if offset > 15 {
+            log::warn!("CountMinSketch: offset {} out of range [0-15]", offset);
+            return false;
+        }
+
         let offset = offset << 2;
         let mask = 0xF << offset;
+
         if self.table[index] & mask != mask {
-            self.table[index] += 1 << offset;
+            self.table[index] = self.table[index].saturating_add(1 << offset);
             return true;
         }
         false
@@ -44,7 +109,8 @@ impl CountMinSketch {
     pub fn add(&mut self, h: u64) {
         let counter_hash = rehash(h);
         let block_hash = h;
-        let block = (block_hash & (self.block_mask as u64)) << 3;
+        let block = (block_hash & (self.block_mask as u64)).saturating_mul(8);
+
         let (index0, offset0) = self.index_of(counter_hash, block, 0);
         let (index1, offset1) = self.index_of(counter_hash, block, 1);
         let (index2, offset2) = self.index_of(counter_hash, block, 2);
@@ -57,26 +123,38 @@ impl CountMinSketch {
         added |= self.inc(index3, offset3);
 
         if added {
-            self.additions += 1;
-            if self.additions == self.sample_size {
+            self.additions = self.additions.saturating_add(1);
+            if self.additions >= self.sample_size {
                 self.reset()
             }
         }
     }
 
     fn reset(&mut self) {
-        let mut count = 0;
+        let mut count: usize = 0;
 
         for i in self.table.iter_mut() {
-            count += (*i & ONE_MASK).count_ones();
+            count = count.saturating_add(((*i & ONE_MASK).count_ones()) as usize);
             *i = (*i >> 1) & RESET_MASK;
         }
 
-        self.additions = (self.additions - ((count >> 2) as usize)) >> 1;
+        self.additions = self.additions.saturating_sub((count >> 2) as usize);
+        self.additions = self.additions >> 1;
+
+        log::debug!("CountMinSketch reset: additions={}", self.additions);
     }
 
     fn count(&self, h: u64, block: u64, offset: u8) -> usize {
         let (index, offset) = self.index_of(h, block, offset);
+
+        if index >= self.table.len() {
+            return 0;
+        }
+
+        if offset > 15 {
+            return 0;
+        }
+
         let offset = offset << 2;
         let count = (self.table[index] >> offset) & 0xF;
         count as usize
@@ -85,11 +163,13 @@ impl CountMinSketch {
     pub fn estimate(&self, h: u64) -> usize {
         let counter_hash = rehash(h);
         let block_hash = h;
-        let block = (block_hash & (self.block_mask as u64)) << 3;
+        let block = (block_hash & (self.block_mask as u64)).saturating_mul(8);
+
         let count0 = self.count(counter_hash, block, 0);
         let count1 = self.count(counter_hash, block, 1);
         let count2 = self.count(counter_hash, block, 2);
         let count3 = self.count(counter_hash, block, 3);
+
         // Calculate minimum directly without iterator allocation
         count0.min(count1).min(count2).min(count3)
     }
@@ -265,5 +345,26 @@ mod tests {
                 assert!(popularity[6] <= popularity[8]);
             }
         }
+    }
+
+    #[test]
+    fn test_sketch_edge_cases() {
+        // Test with size 0
+        let mut sketch = CountMinSketch::new(0);
+        assert!(sketch.table.len() >= 64);
+        sketch.add(1);
+        let _ = sketch.estimate(1);
+
+        // Test with very small size
+        let mut sketch = CountMinSketch::new(1);
+        assert!(sketch.table.len() >= 64);
+        sketch.add(1);
+
+        // Test with large hash values
+        let mut sketch = CountMinSketch::new(1000);
+        sketch.add(u64::MAX);
+        sketch.add(0);
+        let _ = sketch.estimate(u64::MAX);
+        let _ = sketch.estimate(0);
     }
 }

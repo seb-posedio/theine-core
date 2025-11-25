@@ -29,7 +29,11 @@ impl Clock {
     }
 
     pub fn expire_ns(&self, ttl: u64) -> u64 {
-        if ttl > 0 { self.now_ns() + ttl } else { 0 }
+        if ttl > 0 {
+            self.now_ns().saturating_add(ttl)
+        } else {
+            0
+        }
     }
 }
 
@@ -85,6 +89,8 @@ impl TimerWheel {
             wheel.push(tmp);
         }
 
+        log::debug!("TimerWheel initialized with {} levels", buckets.len());
+
         Self {
             buckets,
             spans,
@@ -96,7 +102,7 @@ impl TimerWheel {
     }
 
     fn find_index(&self, expire: u64) -> (u8, u8) {
-        let duration = expire - self.nanos;
+        let duration = expire.saturating_sub(self.nanos);
         for i in 0..5 {
             if duration < self.spans[i + 1] {
                 let ticks = expire >> self.shift[i];
@@ -111,6 +117,25 @@ impl TimerWheel {
         self.deschedule(entry);
         if entry.expire > 0 {
             let w_index = self.find_index(entry.expire);
+
+            // Bounds check
+            if (w_index.0 as usize) >= self.wheel.len() {
+                log::error!(
+                    "TimerWheel schedule: wheel index {} out of bounds",
+                    w_index.0
+                );
+                return;
+            }
+
+            if (w_index.1 as usize) >= self.wheel[w_index.0 as usize].len() {
+                log::error!(
+                    "TimerWheel schedule: slot index {} out of bounds for level {}",
+                    w_index.1,
+                    w_index.0
+                );
+                return;
+            }
+
             entry.wheel_index = w_index;
             let index = self.wheel[w_index.0 as usize][w_index.1 as usize].insert_front(key);
             entry.wheel_list_index = Some(index);
@@ -119,6 +144,29 @@ impl TimerWheel {
 
     pub fn deschedule(&mut self, entry: &mut Entry) {
         let w_index = entry.wheel_index;
+
+        // Bounds check before accessing wheel
+        if (w_index.0 as usize) >= self.wheel.len() {
+            log::warn!(
+                "TimerWheel deschedule: wheel index {} out of bounds",
+                w_index.0
+            );
+            entry.wheel_list_index = None;
+            entry.wheel_index = (0, 0);
+            return;
+        }
+
+        if (w_index.1 as usize) >= self.wheel[w_index.0 as usize].len() {
+            log::warn!(
+                "TimerWheel deschedule: slot index {} out of bounds for level {}",
+                w_index.1,
+                w_index.0
+            );
+            entry.wheel_list_index = None;
+            entry.wheel_index = (0, 0);
+            return;
+        }
+
         if let Some(index) = entry.wheel_list_index {
             self.wheel[w_index.0 as usize][w_index.1 as usize].remove(index);
         }
@@ -150,16 +198,35 @@ impl TimerWheel {
         delta: u64,
         entries: &mut HashMap<u64, Entry>,
     ) -> Vec<u64> {
+        // Bounds check on wheel level
+        if index >= self.wheel.len() {
+            log::error!("TimerWheel expire: index {} out of bounds", index);
+            return Vec::new();
+        }
+
         let mask = (self.buckets[index] - 1) as u64;
         let steps = cmp::min(delta as usize + 1, self.buckets[index]);
         let start = prev_ticks & mask;
-        let end = start + steps as u64;
+        let end = start.saturating_add(steps as u64);
         let mut removed_all = Vec::new();
+
         for i in start..end {
+            let bucket_idx = (i & mask) as usize;
+
+            // Additional bounds check for slot access
+            if bucket_idx >= self.wheel[index].len() {
+                log::warn!(
+                    "TimerWheel expire: bucket index {} out of bounds for level {}",
+                    bucket_idx,
+                    index
+                );
+                continue;
+            }
+
             let mut modified = Vec::new();
             let mut removed = Vec::new();
 
-            for key in self.wheel[index][(i & mask) as usize].iter() {
+            for key in self.wheel[index][bucket_idx].iter() {
                 if let Some(entry) = entries.get(key) {
                     if entry.expire <= self.nanos {
                         removed.push(*key);
@@ -192,6 +259,7 @@ impl TimerWheel {
                 j.clear()
             }
         }
+        log::debug!("TimerWheel cleared");
     }
 }
 
