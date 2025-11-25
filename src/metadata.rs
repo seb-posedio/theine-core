@@ -1,14 +1,18 @@
 use dlv_list::{Index, Iter, VecList};
-use log;
 
 /// Entry represents a cached item with metadata about its position in various data structures.
 ///
-/// Fields:
-/// - policy_list_id: Which list the entry belongs to (0=not in policy, 1=window/lru, 2=probation, 3=protected)
-/// - policy_list_index: Position in the policy list (window, probation, or protected)
-/// - wheel_list_index: Position in the timer wheel for TTL expiration
-/// - wheel_index: Which bucket in the timer wheel (level, slot)
-/// - expire: Expiration time in nanoseconds (0 = no expiration)
+/// # Fields
+///
+/// - `policy_list_id`: Which list the entry belongs to
+///   - `0`: not in policy
+///   - `1`: window/lru
+///   - `2`: probation
+///   - `3`: protected
+/// - `policy_list_index`: Position in the policy list (window, probation, or protected)
+/// - `wheel_list_index`: Position in the timer wheel for TTL expiration
+/// - `wheel_index`: Which bucket in the timer wheel (level, slot)
+/// - `expire`: Expiration time in nanoseconds (0 = no expiration)
 #[derive(Debug, Clone)]
 pub struct Entry {
     pub policy_list_id: u8,
@@ -20,11 +24,15 @@ pub struct Entry {
 
 impl Default for Entry {
     fn default() -> Self {
-        Entry::new()
+        Self::new()
     }
 }
 
 impl Entry {
+    /// Creates a new cache entry with default values.
+    ///
+    /// The entry is not associated with any policy list or timer wheel initially.
+    #[inline]
     pub fn new() -> Self {
         Self {
             policy_list_index: None,
@@ -34,56 +42,12 @@ impl Entry {
             policy_list_id: 0,
         }
     }
-
-    /// Validate that the entry's metadata is consistent
-    pub fn validate(&self) -> Result<(), String> {
-        // Policy list ID must be in valid range [0-3]
-        if self.policy_list_id > 3 {
-            return Err(format!(
-                "Invalid policy_list_id: {}, must be in range [0-3]",
-                self.policy_list_id
-            ));
-        }
-
-        // If policy_list_id is 0, indices should be None
-        if self.policy_list_id == 0 {
-            if self.policy_list_index.is_some() {
-                return Err(
-                    "Entry with policy_list_id=0 should not have policy_list_index set".to_string(),
-                );
-            }
-        } else {
-            // If policy_list_id is 1-3, index should be Some
-            if self.policy_list_index.is_none() {
-                return Err(format!(
-                    "Entry with policy_list_id={} should have policy_list_index set",
-                    self.policy_list_id
-                ));
-            }
-        }
-
-        // Timer wheel indices should be valid ranges
-        if self.wheel_index.0 > 4 {
-            return Err(format!(
-                "Invalid wheel level: {}, must be in range [0-4]",
-                self.wheel_index.0
-            ));
-        }
-
-        // If expire is set, wheel_list_index should be Some
-        if self.expire > 0 && self.wheel_list_index.is_none() {
-            return Err("Entry with expire time should have wheel_list_index set".to_string());
-        }
-
-        Ok(())
-    }
-
-    /// Check if entry is expired given current time
-    pub fn is_expired(&self, now_ns: u64) -> bool {
-        self.expire > 0 && self.expire <= now_ns
-    }
 }
 
+/// A doubly-linked list wrapper for managing ordered entries in the cache policy.
+///
+/// This list maintains entries in insertion order, with O(1) operations for
+/// inserting at the front and moving entries to the front (for LRU/SLRU policies).
 #[derive(Debug)]
 pub struct List<T> {
     pub list: VecList<T>,
@@ -91,57 +55,98 @@ pub struct List<T> {
 }
 
 impl<T> List<T> {
+    /// Creates a new list with the specified capacity.
+    ///
+    /// # Arguments
+    ///
+    /// * `capacity` - The maximum number of items the list can hold. If 0, defaults to 1.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// let list: List<u64> = List::new(100);
+    /// ```
     pub fn new(capacity: usize) -> Self {
-        let capacity = if capacity == 0 { 1 } else { capacity };
-        log::debug!("List created with capacity={}", capacity);
+        let capacity = capacity.max(1);
         Self {
             capacity,
             list: VecList::with_capacity(capacity),
         }
     }
 
-    /// Remove entry at index from list
+    /// Removes entry at index from list.
     ///
-    /// # Note
-    /// This operation is safe - dlv_list handles invalid indices gracefully
+    /// This operation is safe - `dlv_list` handles invalid indices gracefully.
+    ///
+    /// # Arguments
+    ///
+    /// * `index` - The index of the entry to remove
+    #[inline]
     pub fn remove(&mut self, index: Index<T>) {
         self.list.remove(index);
     }
 
-    /// Insert entry to list front and return its index
+    /// Inserts entry to list front and returns its index.
     ///
-    /// Maintains the invariant that newly inserted items are at the front
+    /// Maintains the invariant that newly inserted items are at the front.
+    ///
+    /// # Arguments
+    ///
+    /// * `entry` - The entry to insert
+    ///
+    /// # Returns
+    ///
+    /// The index of the newly inserted entry
     pub fn insert_front(&mut self, entry: T) -> Index<T> {
         if let Some(index) = self.list.front_index() {
             self.list.insert_before(index, entry)
         } else {
-            // no front entry, list is empty
             self.list.push_front(entry)
         }
     }
 
-    /// Get tail entry, return None if empty
+    /// Returns the tail (last) entry, if present.
+    ///
+    /// # Returns
+    ///
+    /// `Some(&T)` if the list is not empty, `None` otherwise
+    #[inline]
     pub fn tail(&self) -> Option<&T> {
         self.list.back()
     }
 
-    /// Returns the value previous to the value at the given index
+    /// Returns the value previous to the value at the given index.
+    ///
+    /// # Arguments
+    ///
+    /// * `index` - The index to look backwards from
+    ///
+    /// # Returns
+    ///
+    /// `Some(&T)` if a previous entry exists, `None` otherwise
     pub fn prev(&self, index: Index<T>) -> Option<&T> {
-        if let Some(prev) = self.list.get_previous_index(index) {
-            self.list.get(prev)
-        } else {
-            None
-        }
+        self.list
+            .get_previous_index(index)
+            .and_then(|prev| self.list.get(prev))
     }
 
-    /// Remove tail entry from list
+    /// Removes and returns the tail entry from the list.
+    ///
+    /// # Returns
+    ///
+    /// `Some(T)` if the list was not empty, `None` if empty
+    #[inline]
     pub fn pop_tail(&mut self) -> Option<T> {
         self.list.pop_back()
     }
 
-    /// Move entry to front of list
+    /// Moves entry to front of list, but only if not already at front.
     ///
-    /// Only moves if the entry is not already at front to avoid unnecessary operations
+    /// This avoids unnecessary operations and maintains LRU semantics efficiently.
+    ///
+    /// # Arguments
+    ///
+    /// * `index` - The index of the entry to move to front
     pub fn touch(&mut self, index: Index<T>) {
         if let Some(front) = self.list.front_index()
             && front != index
@@ -150,25 +155,28 @@ impl<T> List<T> {
         }
     }
 
-    /// Iterate over list entries
+    /// Returns an iterator over the list entries.
+    ///
+    /// # Returns
+    ///
+    /// An iterator from front to back of the list
+    #[inline]
     pub fn iter(&self) -> Iter<'_, T> {
         self.list.iter()
     }
 
-    /// Get current number of entries in list
+    /// Returns the current number of entries in the list.
+    ///
+    /// # Returns
+    ///
+    /// The number of entries currently stored
+    #[inline]
     pub fn len(&self) -> usize {
         self.list.len()
     }
 
-    /// Check if list is empty
-    #[allow(dead_code)]
-    pub fn is_empty(&self) -> bool {
-        self.list.is_empty()
-    }
-
-    /// Clear all entries from the list
+    /// Clears all entries from the list.
     pub fn clear(&mut self) {
         self.list.clear();
-        log::debug!("List cleared");
     }
 }

@@ -1,5 +1,26 @@
+//! Probabilistic data structure for membership testing.
+//!
+//! A Bloom filter is a space-efficient probabilistic data structure that can tell you
+//! whether an element is definitely not in a set or might be in a set.
+//!
+//! # Note on Thread Safety
+//!
+//! `BloomFilter` is not thread-safe. Wrap it in a `Mutex` when sharing across threads.
+
 use pyo3::prelude::*;
 
+/// A Bloom filter implementation optimized for cache admission control.
+///
+/// The filter automatically resets when the number of additions exceeds the
+/// configured insertion count to control false positive rate growth.
+///
+/// # Examples
+///
+/// ```ignore
+/// let mut filter = BloomFilter::new(1000, 0.001);
+/// filter.put(42);
+/// assert!(filter.contains(42));
+/// ```
 #[pyclass]
 pub struct BloomFilter {
     insertions: usize,
@@ -11,20 +32,29 @@ pub struct BloomFilter {
 
 #[pymethods]
 impl BloomFilter {
+    /// Creates a new Bloom filter with the specified false positive probability.
+    ///
+    /// # Arguments
+    ///
+    /// * `insertions` - Expected number of elements to insert. Defaults to 1 if 0.
+    /// * `fpp` - False positive probability. Will be clamped to range [0.001, 0.999].
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// // Create filter for ~100 elements with 0.1% false positive rate
+    /// let filter = BloomFilter::new(100, 0.001);
+    /// ```
     #[new]
     fn new(insertions: usize, fpp: f64) -> Self {
-        // Input validation
-        let insertions = if insertions == 0 { 1 } else { insertions };
-
-        // Clamp FPP to valid range [0.001, 0.999]
-        let fpp = fpp.max(0.001).min(0.999);
+        let insertions = insertions.max(1);
+        let fpp = fpp.clamp(0.001, 0.999);
 
         let ln2 = 2f64.ln();
         let factor = -fpp.ln() / (ln2 * ln2);
-        let mut bits = ((insertions as f64 * factor) as usize).next_power_of_two();
-        if bits == 0 {
-            bits = 1
-        }
+        let bits = ((insertions as f64 * factor) as usize)
+            .next_power_of_two()
+            .max(1);
 
         let slice_count = ((ln2 * bits as f64 / insertions as f64) as usize).max(1);
 
@@ -45,6 +75,14 @@ impl BloomFilter {
         }
     }
 
+    /// Adds a key to the filter.
+    ///
+    /// Automatically resets the filter when the number of additions reaches
+    /// the configured insertion count.
+    ///
+    /// # Arguments
+    ///
+    /// * `key` - The key to add to the filter
     pub fn put(&mut self, key: u64) {
         self.additions += 1;
         if self.additions >= self.insertions {
@@ -52,15 +90,23 @@ impl BloomFilter {
         }
 
         for i in 0..self.slice_count {
-            // Use wrapping arithmetic to prevent overflow
             let hash = key.wrapping_add((i as u64).wrapping_mul(key >> 32));
             let hash_index = (hash & self.bits_mask as u64) as usize;
             self.set(hash_index);
         }
     }
 
+    /// Checks if a bit at the given index is set.
+    ///
+    /// # Arguments
+    ///
+    /// * `key` - The bit index to check
+    ///
+    /// # Returns
+    ///
+    /// `true` if the bit is set, `false` otherwise
+    #[inline]
     fn get(&self, key: usize) -> bool {
-        // Bounds checking
         if key >= self.bits.len() * 64 {
             log::warn!("BloomFilter get: key {} out of bounds", key);
             return false;
@@ -68,18 +114,17 @@ impl BloomFilter {
 
         let idx = key >> 6;
         let offset = key & 63;
-        let mask = 1u64 << offset;
 
-        if idx >= self.bits.len() {
-            return false;
-        }
-
-        let val = self.bits[idx];
-        ((val & mask) >> offset) != 0
+        idx < self.bits.len() && ((self.bits[idx] >> offset) & 1) != 0
     }
 
+    /// Sets a bit at the given index.
+    ///
+    /// # Arguments
+    ///
+    /// * `key` - The bit index to set
+    #[inline]
     fn set(&mut self, key: usize) {
-        // Bounds checking
         if key >= self.bits.len() * 64 {
             log::warn!("BloomFilter set: key {} out of bounds", key);
             return;
@@ -88,21 +133,31 @@ impl BloomFilter {
         let idx = key >> 6;
         let offset = key & 63;
 
-        if idx >= self.bits.len() {
+        if idx < self.bits.len() {
+            self.bits[idx] |= 1u64 << offset;
+        } else {
             log::warn!(
                 "BloomFilter set: computed idx {} exceeds bits length {}",
                 idx,
                 self.bits.len()
             );
-            return;
         }
-
-        let mask = 1u64 << offset;
-        self.bits[idx] |= mask;
     }
 
+    /// Tests whether a key might be in the set.
+    ///
+    /// Returns `false` if the key is definitely not in the set.
+    /// Returns `true` if the key might be in the set (could be a false positive).
+    ///
+    /// # Arguments
+    ///
+    /// * `key` - The key to test for membership
+    ///
+    /// # Returns
+    ///
+    /// `false` if definitely not present, `true` if possibly present
+    #[must_use]
     pub fn contains(&self, key: u64) -> bool {
-        // Early exit if no hashes configured
         if self.slice_count == 0 {
             log::warn!(
                 "BloomFilter contains: slice_count is 0, this indicates a configuration error"
@@ -110,20 +165,14 @@ impl BloomFilter {
             return false;
         }
 
-        let mut result = true;
-        for i in 0..self.slice_count {
-            // Use wrapping arithmetic to safely handle overflows
+        (0..self.slice_count).all(|i| {
             let hash = key.wrapping_add((i as u64).wrapping_mul(key >> 32));
             let hash_index = (hash & self.bits_mask as u64) as usize;
-
-            if !self.get(hash_index) {
-                result = false;
-                break;
-            }
-        }
-        result
+            self.get(hash_index)
+        })
     }
 
+    /// Resets the filter, clearing all bits and resetting the addition counter.
     fn reset(&mut self) {
         self.bits = vec![0; self.bits.len()];
         self.additions = 0;

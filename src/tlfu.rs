@@ -4,7 +4,7 @@ use crate::metadata::Entry;
 use crate::sketch::CountMinSketch;
 use crate::timerwheel::Clock;
 use anyhow::Result;
-use log;
+
 use pyo3::prelude::pyclass;
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -716,7 +716,7 @@ mod tests {
             }
 
             for i in 0..80 {
-                if let Err(_) = tlfu.access(i, &clock, &mut entries) {
+                if tlfu.access(i, &clock, &mut entries).is_err() {
                     // Test access error - continue with other accesses
                 }
             }
@@ -727,7 +727,7 @@ mod tests {
                 tlfu.hit_in_sample = new_hits;
                 tlfu.misses_in_sample = new_misses;
                 tlfu.climb();
-                if let Err(_) = tlfu.resize_window(&mut entries) {
+                if tlfu.resize_window(&mut entries).is_err() {
                     // In tests, resize_window errors indicate bugs in the test setup
                     // but we continue to test the overall behavior
                 }
@@ -749,18 +749,12 @@ mod tests {
         let mut entries = HashMap::new();
 
         for i in 0..200 {
-            let evicted = match tlfu.set(i, &mut entries) {
-                Ok(evicted) => evicted,
-                Err(_) => None, // Test continues even if set fails
-            };
+            let evicted = tlfu.set(i, &mut entries).unwrap_or_default();
             assert!(evicted.is_none());
         }
 
         for i in 0..200 {
-            let evicted = match tlfu.set(i, &mut entries) {
-                Ok(evicted) => evicted,
-                Err(_) => None, // Test continues even if set fails
-            };
+            let evicted = tlfu.set(i, &mut entries).unwrap_or_default();
             assert!(evicted.is_none());
         }
     }

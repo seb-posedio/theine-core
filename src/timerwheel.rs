@@ -1,33 +1,59 @@
+//! Hierarchical timer wheel for efficient TTL expiration scheduling.
+//!
+//! A timer wheel is a data structure for scheduling events at specific times
+//! with O(1) insertion and removal operations. This implementation uses 5 levels
+//! with exponentially increasing time ranges to handle everything from milliseconds
+//! to days efficiently.
+
 use std::cmp;
-use std::time::Duration;
-use std::time::Instant;
-
-use crate::metadata::Entry;
-use crate::metadata::List;
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
+use crate::metadata::{Entry, List};
+
+/// A monotonic clock for tracking elapsed time since cache creation.
+///
+/// Uses `Instant` internally for reliable measurements across system time changes.
+#[derive(Debug)]
 pub struct Clock {
     start: Instant,
 }
 
 impl Default for Clock {
     fn default() -> Self {
-        Clock::new()
+        Self::new()
     }
 }
 
 impl Clock {
+    /// Creates a new clock starting at the current instant.
+    #[inline]
     pub fn new() -> Self {
         Self {
             start: Instant::now(),
         }
     }
 
+    /// Returns the current elapsed time in nanoseconds since clock creation.
+    ///
+    /// # Note
+    ///
+    /// u64 can represent ~500 years in nanoseconds, which is sufficient for cache lifetimes.
+    #[inline]
     pub fn now_ns(&self) -> u64 {
-        // u64 is about 500 years, should be enough for most system, so ignore overflow here
         (Instant::now() - self.start).as_nanos() as u64
     }
 
+    /// Calculates the absolute expiration time given a TTL duration.
+    ///
+    /// # Arguments
+    ///
+    /// * `ttl` - Time-to-live duration in nanoseconds
+    ///
+    /// # Returns
+    ///
+    /// The absolute expiration time in nanoseconds, or 0 if ttl is 0 (no expiration)
+    #[inline]
     pub fn expire_ns(&self, ttl: u64) -> u64 {
         if ttl > 0 {
             self.now_ns().saturating_add(ttl)
@@ -37,6 +63,15 @@ impl Clock {
     }
 }
 
+/// A hierarchical timer wheel for efficient TTL expiration scheduling.
+///
+/// Uses 5 levels with exponentially increasing time ranges:
+/// - Level 0: ~1.07 seconds (64 buckets)
+/// - Level 1: ~1.14 minutes (64 buckets)
+/// - Level 2: ~1.22 hours (32 buckets)
+/// - Level 3: ~1.63 days (4 buckets)
+/// - Level 4: ~6.5 days+ (1 bucket)
+#[derive(Debug)]
 pub struct TimerWheel {
     buckets: Vec<usize>,
     spans: Vec<u64>,
@@ -48,46 +83,42 @@ pub struct TimerWheel {
 
 impl Default for TimerWheel {
     fn default() -> Self {
-        TimerWheel::new()
+        Self::new()
     }
 }
 
 impl TimerWheel {
+    /// Creates a new timer wheel with 5 hierarchical levels.
     pub fn new() -> Self {
         let buckets = vec![64, 64, 32, 4, 1];
         let clock = Clock::new();
         let nanos = clock.now_ns();
+
+        // Pre-calculate span sizes and bit shifts for each level
         let spans = vec![
-            Duration::from_secs(1).as_nanos().next_power_of_two() as u64, // 1.07s
-            Duration::from_secs(60).as_nanos().next_power_of_two() as u64, // 1.14m
-            Duration::from_secs(60 * 60).as_nanos().next_power_of_two() as u64, // 1.22h
+            Duration::from_secs(1).as_nanos().next_power_of_two() as u64, // ~1.07s
+            Duration::from_secs(60).as_nanos().next_power_of_two() as u64, // ~1.14m
+            Duration::from_secs(60 * 60).as_nanos().next_power_of_two() as u64, // ~1.22h
             Duration::from_secs(24 * 60 * 60)
                 .as_nanos()
-                .next_power_of_two() as u64, // 1.63d
+                .next_power_of_two() as u64, // ~1.63d
             (Duration::from_secs(24 * 60 * 60)
                 .as_nanos()
                 .next_power_of_two()
-                * 4) as u64, // 6.5d
+                * 4) as u64, // ~6.5d
             (Duration::from_secs(24 * 60 * 60)
                 .as_nanos()
                 .next_power_of_two()
-                * 4) as u64, // 6.5d
+                * 4) as u64, // ~6.5d
         ];
-        let shift = vec![
-            spans[0].trailing_zeros(),
-            spans[1].trailing_zeros(),
-            spans[2].trailing_zeros(),
-            spans[3].trailing_zeros(),
-            spans[4].trailing_zeros(),
-        ];
-        let mut wheel = Vec::new();
-        for bucket in buckets.iter().take(5) {
-            let mut tmp = Vec::new();
-            for _ in 0..*bucket {
-                tmp.push(List::new(8));
-            }
-            wheel.push(tmp);
-        }
+
+        let shift: Vec<u32> = spans.iter().map(|s| s.trailing_zeros()).collect();
+
+        let wheel = buckets
+            .iter()
+            .take(5)
+            .map(|&bucket_count| (0..bucket_count).map(|_| List::new(8)).collect())
+            .collect();
 
         log::debug!("TimerWheel initialized with {} levels", buckets.len());
 
@@ -101,6 +132,16 @@ impl TimerWheel {
         }
     }
 
+    /// Finds the appropriate wheel level and slot for an expiration time.
+    ///
+    /// # Arguments
+    ///
+    /// * `expire` - Absolute expiration time in nanoseconds
+    ///
+    /// # Returns
+    ///
+    /// `(level, slot)` tuple indicating which level and bucket to use
+    #[inline]
     fn find_index(&self, expire: u64) -> (u8, u8) {
         let duration = expire.saturating_sub(self.nanos);
         for i in 0..5 {
@@ -113,67 +154,81 @@ impl TimerWheel {
         (4, 0)
     }
 
+    /// Schedules an entry in the timer wheel.
+    ///
+    /// First removes the entry from any existing wheel position, then inserts it
+    /// at the appropriate level and slot based on its expiration time.
+    ///
+    /// # Arguments
+    ///
+    /// * `key` - The cache key associated with the entry
+    /// * `entry` - The entry to schedule (modified in place)
     pub fn schedule(&mut self, key: u64, entry: &mut Entry) {
         self.deschedule(entry);
         if entry.expire > 0 {
             let w_index = self.find_index(entry.expire);
 
-            // Bounds check
-            if (w_index.0 as usize) >= self.wheel.len() {
+            if let Some(level) = self.wheel.get_mut(w_index.0 as usize) {
+                if let Some(bucket) = level.get_mut(w_index.1 as usize) {
+                    entry.wheel_index = w_index;
+                    entry.wheel_list_index = Some(bucket.insert_front(key));
+                } else {
+                    log::error!(
+                        "TimerWheel schedule: slot index {} out of bounds for level {}",
+                        w_index.1,
+                        w_index.0
+                    );
+                }
+            } else {
                 log::error!(
                     "TimerWheel schedule: wheel index {} out of bounds",
                     w_index.0
                 );
-                return;
             }
-
-            if (w_index.1 as usize) >= self.wheel[w_index.0 as usize].len() {
-                log::error!(
-                    "TimerWheel schedule: slot index {} out of bounds for level {}",
-                    w_index.1,
-                    w_index.0
-                );
-                return;
-            }
-
-            entry.wheel_index = w_index;
-            let index = self.wheel[w_index.0 as usize][w_index.1 as usize].insert_front(key);
-            entry.wheel_list_index = Some(index);
         }
     }
 
+    /// Removes an entry from the timer wheel.
+    ///
+    /// # Arguments
+    ///
+    /// * `entry` - The entry to remove (modified in place)
     pub fn deschedule(&mut self, entry: &mut Entry) {
         let w_index = entry.wheel_index;
 
-        // Bounds check before accessing wheel
-        if (w_index.0 as usize) >= self.wheel.len() {
+        if let Some(level) = self.wheel.get_mut(w_index.0 as usize) {
+            if let Some(bucket) = level.get_mut(w_index.1 as usize) {
+                if let Some(index) = entry.wheel_list_index {
+                    bucket.remove(index);
+                }
+            } else {
+                log::warn!(
+                    "TimerWheel deschedule: slot index {} out of bounds for level {}",
+                    w_index.1,
+                    w_index.0
+                );
+            }
+        } else {
             log::warn!(
                 "TimerWheel deschedule: wheel index {} out of bounds",
                 w_index.0
             );
-            entry.wheel_list_index = None;
-            entry.wheel_index = (0, 0);
-            return;
         }
 
-        if (w_index.1 as usize) >= self.wheel[w_index.0 as usize].len() {
-            log::warn!(
-                "TimerWheel deschedule: slot index {} out of bounds for level {}",
-                w_index.1,
-                w_index.0
-            );
-            entry.wheel_list_index = None;
-            entry.wheel_index = (0, 0);
-            return;
-        }
-
-        if let Some(index) = entry.wheel_list_index {
-            self.wheel[w_index.0 as usize][w_index.1 as usize].remove(index);
-        }
         entry.wheel_list_index = None;
         entry.wheel_index = (0, 0);
     }
 
+    /// Advances the timer wheel to the current time and expires all stale entries.
+    ///
+    /// # Arguments
+    ///
+    /// * `now` - The current time in nanoseconds
+    /// * `entries` - Mutable reference to the cache entries map
+    ///
+    /// # Returns
+    ///
+    /// Vector of keys that were expired and removed
     pub fn advance(&mut self, now: u64, entries: &mut HashMap<u64, Entry>) -> Vec<u64> {
         let previous = self.nanos;
         self.nanos = now;
@@ -191,6 +246,10 @@ impl TimerWheel {
         removed_all
     }
 
+    /// Processes expiration for a specific wheel level.
+    ///
+    /// Scans through the affected buckets, separating expired entries from those
+    /// that need to be rescheduled to higher levels.
     fn expire(
         &mut self,
         index: usize,
@@ -198,7 +257,6 @@ impl TimerWheel {
         delta: u64,
         entries: &mut HashMap<u64, Entry>,
     ) -> Vec<u64> {
-        // Bounds check on wheel level
         if index >= self.wheel.len() {
             log::error!("TimerWheel expire: index {} out of bounds", index);
             return Vec::new();
@@ -213,7 +271,6 @@ impl TimerWheel {
         for i in start..end {
             let bucket_idx = (i & mask) as usize;
 
-            // Additional bounds check for slot access
             if bucket_idx >= self.wheel[index].len() {
                 log::warn!(
                     "TimerWheel expire: bucket index {} out of bounds for level {}",
@@ -226,6 +283,7 @@ impl TimerWheel {
             let mut modified = Vec::new();
             let mut removed = Vec::new();
 
+            // Collect keys that are expired vs. those that need rescheduling
             for key in self.wheel[index][bucket_idx].iter() {
                 if let Some(entry) = entries.get(key) {
                     if entry.expire <= self.nanos {
@@ -236,27 +294,30 @@ impl TimerWheel {
                 }
             }
 
-            for key in removed.iter() {
-                if let Some(entry) = entries.get_mut(key) {
+            // Deschedule expired entries
+            for &key in &removed {
+                if let Some(entry) = entries.get_mut(&key) {
                     self.deschedule(entry);
                 }
             }
 
-            for key in modified.iter() {
-                if let Some(entry) = entries.get_mut(key) {
-                    self.schedule(*key, entry);
+            // Reschedule entries that aren't actually expired yet
+            for &key in &modified {
+                if let Some(entry) = entries.get_mut(&key) {
+                    self.schedule(key, entry);
                 }
             }
 
-            removed_all.append(&mut removed);
+            removed_all.extend(removed);
         }
         removed_all
     }
 
+    /// Clears all entries from all wheel levels.
     pub fn clear(&mut self) {
-        for i in self.wheel.iter_mut() {
-            for j in i.iter_mut() {
-                j.clear()
+        for level in self.wheel.iter_mut() {
+            for bucket in level.iter_mut() {
+                bucket.clear();
             }
         }
         log::debug!("TimerWheel cleared");

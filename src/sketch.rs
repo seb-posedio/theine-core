@@ -1,8 +1,21 @@
-use log;
+//! Count-Min Sketch probabilistic counter for frequency estimation.
+//!
+//! The Count-Min Sketch is a probabilistic data structure that estimates the frequency
+//! of elements in a stream. It provides O(1) insertion and lookup with controlled
+//! memory usage and accuracy via the false positive parameter.
 
 const RESET_MASK: u64 = 0x7777777777777777;
 const ONE_MASK: u64 = 0x1111111111111111;
 
+/// A Count-Min Sketch data structure for frequency estimation.
+///
+/// This implementation uses a 2D array of 4-bit counters to track item frequencies
+/// with automatic reduction when reaching sample capacity to control accuracy.
+///
+/// # Thread Safety
+///
+/// `CountMinSketch` is not thread-safe. Wrap it in a `Mutex` when sharing across threads.
+#[derive(Debug)]
 pub struct CountMinSketch {
     block_mask: usize,
     table: Vec<u64>,
@@ -11,20 +24,21 @@ pub struct CountMinSketch {
 }
 
 impl CountMinSketch {
-    pub fn new(size: usize) -> CountMinSketch {
-        // Input validation and safety checks
-        let mut sketch_size = size;
-        if sketch_size < 64 {
-            sketch_size = 64;
-            log::debug!(
-                "CountMinSketch: size too small, adjusted to {}",
-                sketch_size
-            );
-        }
-
+    /// Creates a new Count-Min Sketch with the specified size.
+    ///
+    /// # Arguments
+    ///
+    /// * `size` - Desired sketch size. Will be adjusted to at least 64 and next power of two.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// let sketch = CountMinSketch::new(10000);
+    /// ```
+    pub fn new(size: usize) -> Self {
+        let sketch_size = size.max(64);
         let counter_size = sketch_size.next_power_of_two();
 
-        // Prevent excessive memory allocation
         if counter_size > 1 << 20 {
             log::warn!(
                 "CountMinSketch: counter_size {} is very large, may cause memory issues",
@@ -34,7 +48,6 @@ impl CountMinSketch {
 
         let block_mask = (counter_size >> 3).saturating_sub(1);
         let table = vec![0; counter_size];
-
         let sample_size = counter_size.saturating_mul(10);
 
         log::debug!(
@@ -45,7 +58,7 @@ impl CountMinSketch {
             sample_size
         );
 
-        CountMinSketch {
+        Self {
             additions: 0,
             sample_size,
             table,
@@ -53,6 +66,18 @@ impl CountMinSketch {
         }
     }
 
+    /// Computes the table index and counter offset for a given hash and block.
+    ///
+    /// # Arguments
+    ///
+    /// * `counter_hash` - Rehashed value for counter selection
+    /// * `block` - Block offset within the table
+    /// * `offset` - Counter slot (0-3)
+    ///
+    /// # Returns
+    ///
+    /// `(table_index, counter_offset)` pair for accessing the appropriate counter
+    #[inline]
     fn index_of(&self, counter_hash: u64, block: u64, offset: u8) -> (usize, usize) {
         if offset > 3 {
             log::warn!("CountMinSketch: offset {} out of range [0-3]", offset);
@@ -80,8 +105,18 @@ impl CountMinSketch {
         (index_safe, offset_val)
     }
 
+    /// Increments a counter if it hasn't reached the maximum value (15).
+    ///
+    /// # Arguments
+    ///
+    /// * `index` - Table index
+    /// * `offset` - Counter slot offset within the u64
+    ///
+    /// # Returns
+    ///
+    /// `true` if the counter was successfully incremented, `false` if at max
+    #[inline]
     fn inc(&mut self, index: usize, offset: usize) -> bool {
-        // Bounds check
         if index >= self.table.len() {
             log::error!(
                 "CountMinSketch: index {} out of bounds [0-{})",
@@ -96,82 +131,111 @@ impl CountMinSketch {
             return false;
         }
 
-        let offset = offset << 2;
-        let mask = 0xF << offset;
+        let offset_bits = offset << 2;
+        let mask = 0xF << offset_bits;
 
         if self.table[index] & mask != mask {
-            self.table[index] = self.table[index].saturating_add(1 << offset);
+            self.table[index] = self.table[index].saturating_add(1 << offset_bits);
             return true;
         }
         false
     }
 
+    /// Adds a hash value to the sketch, incrementing its frequency counters.
+    ///
+    /// # Arguments
+    ///
+    /// * `h` - Hash value to add
     pub fn add(&mut self, h: u64) {
         let counter_hash = rehash(h);
         let block_hash = h;
         let block = (block_hash & (self.block_mask as u64)).saturating_mul(8);
 
-        let (index0, offset0) = self.index_of(counter_hash, block, 0);
-        let (index1, offset1) = self.index_of(counter_hash, block, 1);
-        let (index2, offset2) = self.index_of(counter_hash, block, 2);
-        let (index3, offset3) = self.index_of(counter_hash, block, 3);
+        let indices: [(usize, usize); 4] = [
+            self.index_of(counter_hash, block, 0),
+            self.index_of(counter_hash, block, 1),
+            self.index_of(counter_hash, block, 2),
+            self.index_of(counter_hash, block, 3),
+        ];
 
-        let mut added: bool;
-        added = self.inc(index0, offset0);
-        added |= self.inc(index1, offset1);
-        added |= self.inc(index2, offset2);
-        added |= self.inc(index3, offset3);
+        let added = indices.iter().any(|(idx, offset)| self.inc(*idx, *offset));
 
         if added {
             self.additions = self.additions.saturating_add(1);
             if self.additions >= self.sample_size {
-                self.reset()
+                self.reset();
             }
         }
     }
 
+    /// Reduces all counters by half to prevent overflow and decay old estimates.
     fn reset(&mut self) {
-        let mut count: usize = 0;
+        let count: usize = self
+            .table
+            .iter_mut()
+            .map(|cell| {
+                let ones = (*cell & ONE_MASK).count_ones() as usize;
+                *cell = (*cell >> 1) & RESET_MASK;
+                ones
+            })
+            .sum();
 
-        for i in self.table.iter_mut() {
-            count = count.saturating_add(((*i & ONE_MASK).count_ones()) as usize);
-            *i = (*i >> 1) & RESET_MASK;
-        }
-
-        self.additions = self.additions.saturating_sub((count >> 2) as usize);
-        self.additions = self.additions >> 1;
-
+        self.additions = self.additions.saturating_sub(count >> 2) >> 1;
         log::debug!("CountMinSketch reset: additions={}", self.additions);
     }
 
+    /// Reads a counter value at the specified position.
+    ///
+    /// # Arguments
+    ///
+    /// * `h` - Rehashed counter value
+    /// * `block` - Block offset
+    /// * `offset` - Counter slot (0-3)
+    ///
+    /// # Returns
+    ///
+    /// The current counter value (0-15)
+    #[inline]
     fn count(&self, h: u64, block: u64, offset: u8) -> usize {
         let (index, offset) = self.index_of(h, block, offset);
 
-        if index >= self.table.len() {
+        if index >= self.table.len() || offset > 15 {
             return 0;
         }
 
-        if offset > 15 {
-            return 0;
-        }
-
-        let offset = offset << 2;
-        let count = (self.table[index] >> offset) & 0xF;
-        count as usize
+        let offset_bits = offset << 2;
+        ((self.table[index] >> offset_bits) & 0xF) as usize
     }
 
+    /// Estimates the frequency of a hash value.
+    ///
+    /// Uses the minimum of all 4 counter values as the estimate
+    /// (the "min trick" of Count-Min Sketch).
+    ///
+    /// # Arguments
+    ///
+    /// * `h` - Hash value to estimate frequency for
+    ///
+    /// # Returns
+    ///
+    /// Estimated frequency (conservative estimate)
+    #[must_use]
+    #[inline]
     pub fn estimate(&self, h: u64) -> usize {
         let counter_hash = rehash(h);
         let block_hash = h;
         let block = (block_hash & (self.block_mask as u64)).saturating_mul(8);
 
-        let count0 = self.count(counter_hash, block, 0);
-        let count1 = self.count(counter_hash, block, 1);
-        let count2 = self.count(counter_hash, block, 2);
-        let count3 = self.count(counter_hash, block, 3);
-
-        // Calculate minimum directly without iterator allocation
-        count0.min(count1).min(count2).min(count3)
+        [
+            self.count(counter_hash, block, 0),
+            self.count(counter_hash, block, 1),
+            self.count(counter_hash, block, 2),
+            self.count(counter_hash, block, 3),
+        ]
+        .iter()
+        .min()
+        .copied()
+        .unwrap_or(0)
     }
 
     #[cfg(test)]
@@ -183,19 +247,21 @@ impl CountMinSketch {
     }
 }
 
+/// Applies a secondary hash to improve distribution.
+///
+/// Uses the MurmurHash3 finalizer to redistribute bits across the counter table.
+#[inline]
 fn rehash(h: u64) -> u64 {
-    let mut h = h.wrapping_mul(0x94d049bb133111eb);
-    h ^= h >> 31;
-    h
+    let h = h.wrapping_mul(0x94d049bb133111eb);
+    h ^ (h >> 31)
 }
 
 #[cfg(test)]
 fn uint64_to_base10_slice(n: u64) -> Vec<i32> {
-    let mut result = vec![0; 16];
-    for i in 0..16 {
-        result[15 - i] = ((n >> (i * 4)) & 0xF) as i32;
-    }
-    result
+    (0..16)
+        .rev()
+        .map(|i| ((n >> (i * 4)) & 0xF) as i32)
+        .collect()
 }
 
 #[cfg(test)]
